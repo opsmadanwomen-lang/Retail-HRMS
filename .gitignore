@@ -6,6 +6,8 @@ dist-ssr
 .env.local
 .DS_Store
 *.tsbuildinfo
+vite.config.js
+vite.config.d.ts
 supabase/.temp
 _build_check.txt
 _tsc_check.txt
