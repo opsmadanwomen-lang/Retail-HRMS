@@ -1,0 +1,46 @@
+-- ============================================================================
+-- Retail HRMS — Fix "Could not create role": duplicate/overloaded
+-- permission_create_role / permission_update_role
+-- Migration 0174
+--
+-- ROOT CAUSE, confirmed live via pg_proc (pg_get_function_identity_arguments):
+--
+--   permission_create_role had 2 live overloads:
+--     (uuid, text, text, text)                -- original, migration 0161
+--     (uuid, text, text, text, integer)       -- widened, migration 0172
+--
+--   permission_update_role had 2 live overloads:
+--     (uuid, text, text)                      -- original, migration 0167
+--     (uuid, text, text, integer)             -- widened, migration 0172
+--
+-- Migration 0172 used `create or replace function ... (..., p_display_order
+-- int default 100)` intending to widen the EXISTING function. PostgreSQL's
+-- CREATE OR REPLACE FUNCTION only replaces a function whose *argument type
+-- list* matches EXACTLY (positionally) — adding a new trailing parameter,
+-- even with a DEFAULT, changes the type list and so creates a SEPARATE,
+-- ADDITIONAL overload instead of replacing the old one. The old 4-arg /
+-- 3-arg versions were left behind, live, un-dropped.
+--
+-- This is invisible to a direct positional SQL call (e.g. the rolled-back
+-- live tests run during the Role Master task), which resolves unambiguously
+-- to the 5-arg/4-arg overload by argument count. It breaks the REAL
+-- browser -> supabase-js -> PostgREST RPC path: CreateRoleDialog.tsx leaves
+-- Display Order blank by default, so permissionService.ts sends
+-- `p_display_order: undefined`, which JSON.stringify DROPS from the request
+-- body entirely. PostgREST then receives a body naming only
+-- (p_company_id, p_code, p_name, p_description) — which matches BOTH
+-- overloads (the 4-arg one exactly; the 5-arg one via its own default for
+-- p_display_order) — an ambiguous call PostgREST/Postgres cannot resolve,
+-- surfaced to the UI as "Could not create role."
+--
+-- FIX: drop ONLY the two now-superseded, narrower overloads. The wider
+-- (migration 0172) versions already contain 100% of the old versions'
+-- behavior (same leading parameters, same body logic) plus the new
+-- optional trailing parameter — nothing is lost. Verified via grep that
+-- permissionService.ts (the only real caller in this codebase) already
+-- calls with the WIDER parameter set. No table, RLS, or authorization
+-- change; is_super_admin() gating is unchanged in the surviving functions.
+-- ============================================================================
+
+drop function if exists public.permission_create_role(uuid, text, text, text);
+drop function if exists public.permission_update_role(uuid, text, text);

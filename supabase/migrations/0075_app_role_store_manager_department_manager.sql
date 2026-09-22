@@ -1,0 +1,44 @@
+-- ============================================================================
+-- Retail HRMS — User & Role Management: extend app_role
+-- Migration 0075
+--
+-- WHY: public.app_role currently only has ('super_admin', 'company_admin',
+-- 'staff') (migrations 0001, 0020). The central User Management screen's
+-- required role list (Part 4) additionally needs 'store_manager' and
+-- 'department_manager' as real, selectable, distinct role values.
+--
+-- 'operations_manager' and 'super_manager' are DELIBERATELY NOT added here.
+-- Investigation (migration 0047/0061 + NightDutyManagerAccessPage.tsx's own
+-- documented comments) confirms the EXISTING, already-fully-working Night
+-- Duty approval system represents an Operations Manager / Super Manager as a
+-- role='staff' login whose real authority comes from an active row in
+-- attendance_operations_manager_assignments / attendance_super_managers
+-- (keyed by employees.id, resolved via current_user_employee_id()) — NOT
+-- from profiles.role. Three RLS policies (employees, attendance_night_duty_
+-- approvals, attendance_records — migration 0061) specifically branch on
+-- current_user_role() = 'staff' combined with those assignment tables to
+-- grant store/company-scoped visibility. Introducing distinct 'operations_
+-- manager'/'super_manager' enum values would silently defeat those branches
+-- for any newly-created such user (falling back to broader "any non-staff,
+-- same company" visibility instead) and would create a SECOND, parallel way
+-- to represent "who is an Operations Manager" alongside the existing
+-- assignment tables — exactly the duplication this task's instructions
+-- forbid ("DO NOT create a new Night Duty system"). User Management's
+-- "Create User" flow instead provisions Operations Manager / Super Manager
+-- choices as role='staff' + an employees row + the existing assignment
+-- tables, reusing 100% of the already-built, already-tested mechanism —
+-- see the new user-account Edge Function and UserManagementPage.
+--
+-- 'store_manager' / 'department_manager' have NO existing concrete
+-- permission logic anywhere in the codebase to preserve or conflict with
+-- (confirmed by inspection — no table, RLS policy, or RPC references
+-- either name), so adding them is a pure, inert extension: a real role
+-- value + basic same-company visibility (via the existing generic "non-
+-- staff, same company" RLS branches every non-staff role already has),
+-- with no route currently gating on them and no promise of any specific
+-- deeper permission beyond that — matching this task's own instruction that
+-- their permissions "must remain unchanged" (there being none to change).
+-- ============================================================================
+
+ALTER TYPE public.app_role ADD VALUE IF NOT EXISTS 'store_manager';
+ALTER TYPE public.app_role ADD VALUE IF NOT EXISTS 'department_manager';

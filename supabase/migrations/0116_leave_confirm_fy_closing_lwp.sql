@@ -1,0 +1,121 @@
+-- ============================================================================
+-- Retail HRMS — Leave Management, Phase 4: LWP at FY Closing
+-- Migration 0116
+--
+-- Section 12 (LWP): if a leave type's negative_balance_allowed permitted the
+-- running balance to go negative during the year, that shortfall is Leave
+-- Without Pay. No payroll deduction FORMULA exists anywhere in this
+-- codebase (confirmed by audit — no payroll module at all), so per the
+-- master prompt's own explicit allowance ("Do NOT invent salary formulas...
+-- Create a clearly marked integration-ready transaction only"), this posts
+-- days only, amount = null, for a future Payroll phase to price.
+-- Byte-identical to 0113 otherwise.
+-- ============================================================================
+create or replace function public.leave_confirm_fy_closing(
+  p_financial_year_id uuid,
+  p_next_financial_year_id uuid default null,
+  p_remark text default null
+)
+returns public.leave_fy_closing_batches
+language plpgsql
+security definer
+as $$
+declare
+  v_fy record;
+  v_next_fy record;
+  v_batch public.leave_fy_closing_batches;
+  v_line record;
+begin
+  if not (public.is_super_admin() or public.current_user_role() <> 'staff') then
+    raise exception 'Only Admin/HR may close a Financial Year.' using errcode = '42501';
+  end if;
+
+  select id, company_id, start_date, end_date, status into v_fy from public.leave_financial_years where id = p_financial_year_id;
+  if v_fy.id is null then
+    raise exception 'Financial Year not found.';
+  end if;
+
+  if not public.is_super_admin() and v_fy.company_id <> public.current_user_company_id() then
+    raise exception 'This Financial Year belongs to a different company.' using errcode = '42501';
+  end if;
+
+  if exists (select 1 from public.leave_fy_closing_batches where company_id = v_fy.company_id and financial_year_id = p_financial_year_id and status = 'closed') then
+    raise exception 'This Financial Year has already been closed.';
+  end if;
+
+  if p_next_financial_year_id is not null then
+    select id, company_id, start_date into v_next_fy from public.leave_financial_years where id = p_next_financial_year_id;
+    if v_next_fy.id is null or v_next_fy.company_id <> v_fy.company_id then
+      raise exception 'The specified next Financial Year is invalid.';
+    end if;
+  end if;
+
+  insert into public.leave_fy_closing_batches (company_id, financial_year_id, next_financial_year_id, status, initiated_by, remark)
+  values (v_fy.company_id, p_financial_year_id, p_next_financial_year_id, 'processing', auth.uid(), p_remark)
+  returning * into v_batch;
+
+  for v_line in select * from public.leave_compute_fy_closing(p_financial_year_id) loop
+    insert into public.leave_fy_closing_lines (
+      batch_id, employee_id, leave_type_id, policy_id, policy_version,
+      opening, earned, used, pending, available,
+      carry_forward_days, encashment_days, lapse_days,
+      basic_salary_snapshot, da_snapshot, salary_base_snapshot, divisor_snapshot, daily_rate, encashment_amount,
+      final_status
+    ) values (
+      v_batch.id, v_line.employee_id, v_line.leave_type_id, v_line.policy_id, v_line.policy_version,
+      v_line.opening, v_line.earned, v_line.used, v_line.pending, v_line.available,
+      v_line.carry_forward_days, v_line.encashment_days, v_line.lapse_days,
+      v_line.basic_salary_snapshot, v_line.da_snapshot, v_line.salary_base_snapshot, v_line.divisor_snapshot, v_line.daily_rate, v_line.encashment_amount,
+      v_line.final_status
+    );
+
+    if v_line.carry_forward_days > 0 then
+      if p_next_financial_year_id is null then
+        raise exception 'At least one employee has leave to carry forward but no next Financial Year was specified. Create the next Financial Year first (Leave Management > Financial Years), then retry closing with it selected.';
+      end if;
+      insert into public.leave_ledger (company_id, employee_id, leave_type_id, financial_year_id, transaction_type, transaction_date, days, reference_type, reference_id, remark, created_by)
+      values (v_fy.company_id, v_line.employee_id, v_line.leave_type_id, p_next_financial_year_id, 'carry_forward', v_next_fy.start_date, v_line.carry_forward_days, 'leave_fy_closing_batch', v_batch.id, format('Carried forward from Financial Year closing (batch %s).', v_batch.id), auth.uid());
+    end if;
+
+    if v_line.encashment_days > 0 then
+      insert into public.leave_ledger (company_id, employee_id, leave_type_id, financial_year_id, transaction_type, transaction_date, days, reference_type, reference_id, remark, created_by)
+      values (v_fy.company_id, v_line.employee_id, v_line.leave_type_id, p_financial_year_id, 'encashment', v_fy.end_date, -v_line.encashment_days, 'leave_fy_closing_batch', v_batch.id, format('Encashed at Financial Year closing (batch %s).', v_batch.id), auth.uid());
+
+      insert into public.payroll_leave_transactions (company_id, employee_id, financial_year_id, leave_type_id, transaction_type, days, amount, source, status, fy_closing_batch_id, created_by)
+      values (v_fy.company_id, v_line.employee_id, p_financial_year_id, v_line.leave_type_id, 'encashment', v_line.encashment_days, v_line.encashment_amount, 'leave_fy_closing', 'pending', v_batch.id, auth.uid())
+      on conflict (employee_id, financial_year_id, leave_type_id, transaction_type) do nothing;
+
+      perform public.leave_notify(v_fy.company_id, v_line.employee_id, 'encashment_generated', 'Leave encashment processed',
+        format('%s day(s) encashed for %s.', v_line.encashment_days, coalesce(v_line.encashment_amount::text, 'an amount pending calculation')), 'leave_fy_closing_batch', v_batch.id);
+    end if;
+
+    if v_line.lapse_days > 0 then
+      insert into public.leave_ledger (company_id, employee_id, leave_type_id, financial_year_id, transaction_type, transaction_date, days, reference_type, reference_id, remark, created_by)
+      values (v_fy.company_id, v_line.employee_id, v_line.leave_type_id, p_financial_year_id, 'lapse', v_fy.end_date, -v_line.lapse_days, 'leave_fy_closing_batch', v_batch.id, format('Lapsed at Financial Year closing (batch %s).', v_batch.id), auth.uid());
+
+      perform public.leave_notify(v_fy.company_id, v_line.employee_id, 'lapse_generated', 'Leave lapsed',
+        format('%s day(s) lapsed at Financial Year closing.', v_line.lapse_days), 'leave_fy_closing_batch', v_batch.id);
+    end if;
+
+    -- LWP — integration-ready only, no invented deduction formula (see header note).
+    if v_line.available < 0 then
+      insert into public.payroll_leave_transactions (company_id, employee_id, financial_year_id, leave_type_id, transaction_type, days, amount, source, status, fy_closing_batch_id, created_by)
+      values (v_fy.company_id, v_line.employee_id, p_financial_year_id, v_line.leave_type_id, 'lwp_deduction', abs(v_line.available), null, 'leave_fy_closing', 'pending', v_batch.id, auth.uid())
+      on conflict (employee_id, financial_year_id, leave_type_id, transaction_type) do nothing;
+
+      insert into public.leave_ledger (company_id, employee_id, leave_type_id, financial_year_id, transaction_type, transaction_date, days, reference_type, reference_id, remark, created_by)
+      values (v_fy.company_id, v_line.employee_id, v_line.leave_type_id, p_financial_year_id, 'lwp_conversion', v_fy.end_date, 0, 'leave_fy_closing_batch', v_batch.id, format('%s day(s) recorded as Leave Without Pay at Financial Year closing (amount to be priced by Payroll).', abs(v_line.available)), auth.uid());
+    end if;
+  end loop;
+
+  update public.leave_fy_closing_batches set status = 'closed', closed_by = auth.uid(), closed_at = now() where id = v_batch.id returning * into v_batch;
+  update public.leave_financial_years set status = 'closed', updated_by = auth.uid() where id = p_financial_year_id;
+
+  if public.current_user_employee_id() is not null then
+    perform public.leave_notify(v_fy.company_id, public.current_user_employee_id(), 'financial_year_closed', 'Financial Year closed',
+      format('Financial Year closing completed (batch %s).', v_batch.id), 'leave_fy_closing_batch', v_batch.id);
+  end if;
+
+  return v_batch;
+end;
+$$;
