@@ -1044,10 +1044,23 @@ function PolicyEngineTab({ companyId }: { companyId?: string }) {
                   <label className="flex items-center gap-2 text-sm"><Checkbox checked={cur.ndEarningEnabled} onCheckedChange={(v) => set("ndEarningEnabled", Boolean(v))} disabled={!editable} /> Enable night-duty payroll earning</label>
                   <div className="grid gap-3 sm:grid-cols-3">
                     <Pick label="Rate type" value={cur.ndRateType} opts={ND_RATE_TYPES} on={(v) => set("ndRateType", v)} disabled={!editable} />
-                    <NumF label="Rate (₹ or %)" v={cur.ndRate} on={(v) => set("ndRate", v)} disabled={!editable} />
-                    <Pick label="Basis" value={cur.ndBasis} opts={SALARY_BASES.filter((b) => b.v !== "custom")} on={(v) => set("ndBasis", v)} disabled={!editable} />
-                    <div className="sm:col-span-3"><Label className="text-xs">Custom formula</Label><Input value={cur.ndCustomFormula ?? ""} onChange={(e) => set("ndCustomFormula", e.target.value)} placeholder="NDVALUE * 75" disabled={!editable} /></div>
+                    {cur.ndRateType !== "custom_formula" && (
+                      <NumF label={cur.ndRateType === "fixed" ? "Rate (₹ per unit)" : "Rate (%)"} v={cur.ndRate} on={(v) => set("ndRate", v)} disabled={!editable} />
+                    )}
+                    <Pick label="Basis (payslip label only)" value={cur.ndBasis} opts={SALARY_BASES.filter((b) => b.v !== "custom")} on={(v) => set("ndBasis", v)} disabled={!editable} />
                   </div>
+                  {cur.ndRateType === "custom_formula" && (
+                    <div className="space-y-1.5">
+                      <Label className="text-xs">Custom formula (result = the rate PER unit; NDVALUE is available if the rate itself should vary by units worked)</Label>
+                      <Input value={cur.ndCustomFormula ?? ""} onChange={(e) => set("ndCustomFormula", e.target.value)} placeholder="75" disabled={!editable} />
+                    </div>
+                  )}
+                  {cur.ndEarningEnabled && !cur.ndRateType && (
+                    <p className="text-xs text-amber-700">Choose a Rate Type — nothing will be paid until one is selected.</p>
+                  )}
+                  <p className="text-xs text-muted-foreground">
+                    If the selected Rate Type has no rate (or formula) configured, Night Duty shows ₹0 with a review flag — nothing is ever guessed or silently zeroed.
+                  </p>
                   <SaveBar dirty={dirty} onSave={() => saveScalars(["ndEarningEnabled", "ndRateType", "ndRate", "ndBasis", "ndCustomFormula"])} onReset={resetDraft} pending={update.isPending} />
                 </TabsContent>
 

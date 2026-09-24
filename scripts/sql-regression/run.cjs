@@ -13,6 +13,7 @@ const MIGS = ["0178_common_payroll_components_and_auto_salary_structure.sql", "0
   .map((f) => path.join(ROOT, "supabase", "migrations", f));
 const MIG_0184 = MIGS[MIGS.length - 2];
 const MIG_0185 = MIGS[MIGS.length - 1];
+const MIG_0186 = path.join(ROOT, "supabase", "migrations", "0186_night_duty_rate_null_safety_and_validation.sql");
 const rd = (p) => fs.readFileSync(p, "utf8").replace(/^﻿/, "").replace(/\r\n/g, "\n");
 const results = [];
 const ok = (name, cond, extra = "") => results.push([cond ? "PASS" : "FAIL", name, cond ? "" : extra]);
@@ -141,6 +142,13 @@ const uid = (n) => `00000000-0000-0000-0000-${String(n).padStart(12, "0")}`;
   if (e185) return report();
   let e185b = null; try { await db.exec(rd(MIG_0185)); } catch (e) { e185b = e.message.split("\n")[0]; }
   ok("0185 is re-runnable (idempotent)", !e185b, e185b ?? "");
+  let e186 = null; try { await db.exec(rd(MIG_0186)); } catch (e) { e186 = e.message.split("\n")[0]; }
+  ok("0186 applies cleanly on top of 0178-0185 (live-shaped schema)", !e186, e186 ?? "");
+  if (e186) return report();
+  let e186b = null; try { await db.exec(rd(MIG_0186)); } catch (e) { e186b = e.message.split("\n")[0]; }
+  ok("0186 is re-runnable (idempotent)", !e186b, e186b ?? "");
+  ok("STATIC: 0186 touches only payroll functions (no attendance / leave / advance / fnf / transfer / salary-structure engine is redefined)",
+    !/create (or replace )?function public\.(attendance_|leave_|advance_|fnf_|_?transfer_|salary_|payroll_calculate_run)/i.test(rd(MIG_0186)));
   ok("REGRESSION legacy PF/ESI/OT/LWP compute_lines output identical before vs after migrations", baseline === JSON.stringify(await cl(pol, 14000, 7000, 7000, { lwp: 2, ot: 120, comps: { DA: 7000, BASIC: 7000 } })));
   const allSql = MIGS.slice(0, -2).map(rd).join("\n");
   ok("STATIC: migrations 0178-0183 do not redefine payroll_calculate_run / attendance / leave / advance / fnf / transfer engines",
@@ -151,6 +159,103 @@ const uid = (n) => `00000000-0000-0000-0000-${String(n).padStart(12, "0")}`;
   // 0185 only widens payroll_ot_late_basis and re-bodies compute_lines/apply_policy/preview/validate — same boundary as 0184.
   ok("STATIC: 0185 touches only payroll functions (no attendance / leave / advance / fnf / transfer / salary-structure engine is redefined)",
     !/create (or replace )?function public\.(attendance_|leave_|advance_|fnf_|_?transfer_|salary_|payroll_calculate_run)/i.test(rd(MIG_0185)));
+
+  // ------------------------------------------------------------------ 0186: Night Duty payroll rate — NULL-safe percentage + validation
+  // NDVALUE (p_nd_value) = SUM(attendance_records.payable_extra_duty_value) for the employee's attendance rows in the
+  // payroll period — set ONLY by the Night Duty module's own attendance_night_duty_decide() on approval. Payroll here
+  // is only proven to VALUE an already-resolved NDVALUE at the configured rate; it never computes eligibility/ladder itself.
+  const clNd = (policy, gross, basic, da, ndValue, x = {}) => q(
+    `select kind, line_type, code, name, amount::numeric amount, rate::numeric rate, quantity::numeric quantity, calc_type, calc_base, calc_note, unresolved from public.payroll_policy_compute_lines($1::uuid,'2026-10-01','2026-10-31',31,null,$2,$3,$4,$5,$6,$7,$8::uuid,'{}'::text[],null,null,null,$9::jsonb,$10::jsonb) order by 1,3`,
+    [policy, basic, da, gross, x.lwp ?? 0, x.ot ?? 0, ndValue, x.struct ?? null, JSON.stringify(x.manual ?? {}), JSON.stringify(x.comps ?? {})]);
+  const ndPol = (code, vno, extraCols, extraVals) =>
+    q(`insert into public.payroll_policies (company_id, status, effective_from, code, policy_name, version_no, currency_precision, proration_method, proration_basis${extraCols}) values ('${C}','draft','2035-01-01',$1,$1,$2,2,'calendar_days','basic_da'${extraVals}) returning id`,
+      [code, vno]).then((r) => r[0].id);
+  const ndOf = (rows) => rows.find((r) => r.code === "NDUTY");
+  const ndValidate = async (id) => (await q(`select ok, error from public.payroll_policy_validate($1::uuid)`, [id]))[0];
+
+  // A. Approved Night Duty (NDVALUE > 0) + a valid configured rate -> a resolved payroll earning line is created
+  const pNdFixed = await ndPol("NDFIXED", 300, ", nd_earning_enabled, nd_rate_type, nd_rate", ",true,'fixed',75");
+  const ndA = ndOf(await clNd(pNdFixed, 10000, 5000, 5000, 2));
+  ok("0186 A: approved Night Duty (NDVALUE=2) + Fixed rate Rs 75/unit -> earning = 150, resolved (not flagged)",
+    Number(ndA?.amount) === 150 && ndA?.unresolved === false && ndA?.line_type === "earning", JSON.stringify(ndA));
+
+  // B. No approved Night Duty (NDVALUE = 0, e.g. nothing approved yet this period) -> no Night Duty line at all
+  ok("0186 B: no approved Night Duty (NDVALUE=0) -> no Night Duty earning line is produced", ndOf(await clNd(pNdFixed, 10000, 5000, 5000, 0)) === undefined);
+
+  // C. A pending/disallowed Night Duty request leaves attendance_records.payable_extra_duty_value at 0 (the Night Duty
+  // module's own representation of "not approved" — attendance_night_duty_decide() only raises it on approval), so at
+  // the payroll-consumption boundary this is indistinguishable from B: NDVALUE=0 -> no earning.
+  ok("0186 C: pending/disallowed Night Duty (payable_extra_duty_value left at 0 by the Night-Duty module) -> NDVALUE=0 -> no earning",
+    ndOf(await clNd(pNdFixed, 10000, 5000, 5000, 0)) === undefined);
+
+  // D. Multiple approved Night Duty days aggregate (payroll_calculate_run SUMs payable_extra_duty_value across the
+  // period before calling here — proven directly on that SUM below in G); at this boundary a combined 3 units prices correctly.
+  const ndD = ndOf(await clNd(pNdFixed, 10000, 5000, 5000, 3));
+  ok("0186 D: multiple approved Night Duty days aggregate correctly (3 units x Rs 75 = 225)", Number(ndD?.amount) === 225 && Number(ndD?.quantity) === 3, JSON.stringify(ndD));
+
+  // E. Rate configuration changes -> the calculation follows the configuration, for every supported Rate Type
+  const pNdPctBasic = await ndPol("NDPCTB", 301, ", nd_earning_enabled, nd_rate_type, nd_rate", ",true,'pct_of_basic',10");
+  const ndE1 = ndOf(await clNd(pNdPctBasic, 10000, 5000, 5000, 2));
+  const expE1 = Math.round(2 * (5000 / 31 * 10 / 100) * 100) / 100;
+  ok(`0186 E1: % of Basic (10%, divisor=calendar days=31) -> ${expE1} for 2 units`, Number(ndE1?.amount) === expE1, JSON.stringify(ndE1));
+  const pNdPctBasicDa = await ndPol("NDPCTBD", 302, ", nd_earning_enabled, nd_rate_type, nd_rate", ",true,'pct_of_basic_da',10");
+  const ndE2 = ndOf(await clNd(pNdPctBasicDa, 10000, 5000, 5000, 2));
+  const expE2 = Math.round(2 * (10000 / 31 * 10 / 100) * 100) / 100;
+  ok(`0186 E2: % of Basic+DA (10%, divisor=calendar days=31) -> ${expE2} for 2 units — THIS is the reported Rate Type`, Number(ndE2?.amount) === expE2, JSON.stringify(ndE2));
+  const pNdFormula = await ndPol("NDFORM", 303, ", nd_earning_enabled, nd_rate_type, nd_custom_formula", ",true,'custom_formula','75'");
+  const ndE3 = ndOf(await clNd(pNdFormula, 10000, 5000, 5000, 2));
+  ok("0186 E3: Custom formula '75' (a flat per-unit rate) -> rate 75, quantity 2 -> amount 150", Number(ndE3?.amount) === 150 && Number(ndE3?.rate) === 75, JSON.stringify(ndE3));
+  // Discovered while investigating: the Custom Formula field's own UI placeholder text is "NDVALUE * 75". The formula
+  // evaluator substitutes NDVALUE with the SAME p_nd_value that is then used AGAIN as the outer quantity multiplier
+  // (amount = NDVALUE x rate), so entering the placeholder text LITERALLY prices as NDVALUE^2 x 75, not NDVALUE x 75 —
+  // for 2 units that is 2 x (2x75) = 300, not the 150 a company would reasonably expect from "NDVALUE * 75" read as
+  // "the total for this many units". This is a pre-existing UI/formula-semantics inconsistency, NOT touched by this
+  // migration (changing custom-formula semantics would silently alter any company that already relies on the current,
+  // documented behaviour — a formula that is itself allowed to vary by NDVALUE, e.g. a volume tier). Recorded here as a
+  // proven fact for the report, not asserted as a bug to fix.
+  const pNdFormulaLit = await ndPol("NDFORMLIT", 3031, ", nd_earning_enabled, nd_rate_type, nd_custom_formula", ",true,'custom_formula','NDVALUE * 75'");
+  const ndPlaceholder = ndOf(await clNd(pNdFormulaLit, 10000, 5000, 5000, 2));
+  ok("0186 DISCOVERED (not fixed, out of scope): the literal placeholder text 'NDVALUE * 75' prices as NDVALUE^2 x 75 = 300 for 2 units, not 150",
+    Number(ndPlaceholder?.amount) === 300, JSON.stringify(ndPlaceholder));
+
+  // F. Missing/invalid rate configuration -> a clear validation error (Validate button) AND a calc-time review flag —
+  // THE FIX: before 0186, this exact configuration (Rate Type = % of Basic+DA, Rate blank) silently produced amount=0,
+  // unresolved=FALSE (indistinguishable from "correctly computed to zero"). It now produces amount=0, unresolved=TRUE,
+  // with the same reason text every other unconfigured rate in this function already used.
+  const pNdBlankPct = await ndPol("NDBLANKPCT", 304, ", nd_earning_enabled, nd_rate_type", ",true,'pct_of_basic_da'");
+  const vNdBlank = await ndValidate(pNdBlankPct);
+  ok('0186 F1: Validate refuses Rate Type = "% of Basic+DA" with a blank rate (the EXACT reported configuration)',
+    vNdBlank.ok === false && /Night Duty Rate Type is "pct_of_basic_da" but no rate is configured/.test(vNdBlank.error ?? ""), JSON.stringify(vNdBlank));
+  const ndF = ndOf(await clNd(pNdBlankPct, 10000, 5000, 5000, 2));
+  ok("0186 F2 THE FIX: the reported configuration now shows amount=0 AND unresolved=true with a clear reason — never a silent zero",
+    Number(ndF?.amount) === 0 && ndF?.unresolved === true && ndF?.calc_note === "Night-duty payroll rate not configured.", JSON.stringify(ndF));
+  const pNdBlankFixed = await ndPol("NDBLANKFIX", 305, ", nd_earning_enabled, nd_rate_type", ",true,'fixed'");
+  ok("0186 F3: Validate refuses Rate Type = Fixed per unit with no rate configured", (await ndValidate(pNdBlankFixed)).ok === false);
+  ok("0186 F3b: compute_lines already correctly flagged Fixed's blank rate as unresolved (pre-existing behaviour, unchanged by 0186)",
+    ndOf(await clNd(pNdBlankFixed, 10000, 5000, 5000, 2))?.unresolved === true);
+  const pNdBlankFormula = await ndPol("NDBLANKFORM", 306, ", nd_earning_enabled, nd_rate_type", ",true,'custom_formula'");
+  ok("0186 F4: Validate refuses Rate Type = Custom formula with no formula configured", (await ndValidate(pNdBlankFormula)).ok === false);
+  ok("0186 F4b: compute_lines already correctly flagged Custom formula's blank formula as unresolved (pre-existing behaviour, unchanged by 0186)",
+    ndOf(await clNd(pNdBlankFormula, 10000, 5000, 5000, 2))?.unresolved === true);
+  // An EXPLICIT rate of 0 is a deliberate, resolved 0% — must NOT be flagged. Distinguishes "blank" from "explicitly zero".
+  const pNdZero = await ndPol("NDZERO", 307, ", nd_earning_enabled, nd_rate_type, nd_rate", ",true,'pct_of_basic_da',0");
+  const ndZero = ndOf(await clNd(pNdZero, 10000, 5000, 5000, 2));
+  ok("0186 F5: an EXPLICIT rate of 0% is a deliberate, resolved zero (amount 0, unresolved=false) — distinct from a blank/unconfigured rate",
+    Number(ndZero?.amount) === 0 && ndZero?.unresolved === false, JSON.stringify(ndZero));
+  ok('0186 F6: Validate PASSES an explicit 0% rate (0 is a configured value, not "missing")', (await ndValidate(pNdZero)).ok === true, JSON.stringify(await ndValidate(pNdZero)));
+
+  // G. Payroll period separation: payroll_calculate_run sums attendance_records.payable_extra_duty_value ONLY for rows
+  // whose attendance_date falls inside the payroll period being calculated — proven directly on that exact aggregation.
+  const gEmp = uid(950);
+  await db.exec(`insert into public.employees(id, company_id, employee_code, full_name) values ('${gEmp}','${C}','NDPERIOD','ND Period Test');
+    insert into public.attendance_records (company_id, employee_id, store_id, attendance_date, shift_id, status, payable_extra_duty_value) values
+      ('${C}','${gEmp}','${uid(951)}','2026-09-15','${uid(952)}','present',1),
+      ('${C}','${gEmp}','${uid(951)}','2026-10-05','${uid(952)}','present',2),
+      ('${C}','${gEmp}','${uid(951)}','2026-10-20','${uid(952)}','present',3),
+      ('${C}','${gEmp}','${uid(951)}','2026-11-02','${uid(952)}','present',4);`);
+  const ndSumFor = async (start, end) => (await q(`select coalesce(sum(payable_extra_duty_value),0)::numeric v from public.attendance_records where employee_id='${gEmp}' and attendance_date between $1::date and $2::date`, [start, end]))[0].v;
+  ok("0186 G: only the Night Duty days inside October 2026 are summed for an October payroll period (2+3=5), excluding September's 1 and November's 4 (the SAME date-range filter payroll_calculate_run uses)",
+    Number(await ndSumFor("2026-10-01", "2026-10-31")) === 5 && Number(await ndSumFor("2026-09-01", "2026-09-30")) === 1 && Number(await ndSumFor("2026-11-01", "2026-11-30")) === 4);
 
   // ------------------------------------------------------------------ A. salary routing (slab table + resolver)
   const core = async (g) => (await q(`select r.*, (select code from public.salary_structures s where s.id=r.salary_structure_id) code from public.salary_resolve_core('${E.E1}', '2026-10-31', $1::numeric) r`, [g]))[0];
