@@ -806,7 +806,8 @@ const statMethodUiValue = (method: string, base: string | null): string => {
 };
 const ND_RATE_TYPES = [
   { v: "fixed", label: "Fixed per unit" }, { v: "pct_of_basic", label: "% of Basic" },
-  { v: "pct_of_basic_da", label: "% of Basic+DA" }, { v: "custom_formula", label: "Custom formula" },
+  { v: "pct_of_basic_da", label: "% of Basic+DA" }, { v: "basic_da_per_calendar_day", label: "Basic+DA ÷ Calendar Days (no %)" },
+  { v: "custom_formula", label: "Custom formula" },
 ];
 const ALL_DED_CODES = ["PF", "ESI", "PT", "TDS", "LWP", "LATE", "ADVREC"];
 
@@ -1044,14 +1045,19 @@ function PolicyEngineTab({ companyId }: { companyId?: string }) {
                   <label className="flex items-center gap-2 text-sm"><Checkbox checked={cur.ndEarningEnabled} onCheckedChange={(v) => set("ndEarningEnabled", Boolean(v))} disabled={!editable} /> Enable night-duty payroll earning</label>
                   <div className="grid gap-3 sm:grid-cols-3">
                     <Pick label="Rate type" value={cur.ndRateType} opts={ND_RATE_TYPES} on={(v) => set("ndRateType", v)} disabled={!editable} />
-                    {cur.ndRateType !== "custom_formula" && (
+                    {cur.ndRateType !== "custom_formula" && cur.ndRateType !== "basic_da_per_calendar_day" && (
                       <NumF label={cur.ndRateType === "fixed" ? "Rate (₹ per unit)" : "Rate (%)"} v={cur.ndRate} on={(v) => set("ndRate", v)} disabled={!editable} />
                     )}
                     <Pick label="Basis (payslip label only)" value={cur.ndBasis} opts={SALARY_BASES.filter((b) => b.v !== "custom")} on={(v) => set("ndBasis", v)} disabled={!editable} />
                   </div>
+                  {cur.ndRateType === "basic_da_per_calendar_day" && (
+                    <p className="text-xs text-muted-foreground rounded-md border bg-muted/40 px-3 py-2">
+                      Calculation: <span className="font-medium text-foreground">Basic + DA ÷ Calendar Days × Night Duty Units</span>. Calendar Days is the actual number of days in the payroll period being processed — no percentage, no rate to enter, and this never changes if the Proration or OT/Late settings change.
+                    </p>
+                  )}
                   {cur.ndRateType === "custom_formula" && (
                     <div className="space-y-1.5">
-                      <Label className="text-xs">Custom formula (result = the rate PER unit; NDVALUE is available if the rate itself should vary by units worked)</Label>
+                      <Label className="text-xs">Custom formula (result = the rate PER unit, multiplied by ND units automatically). Available: BASIC, DA, GROSS, NDVALUE, DIVISOR (proration divisor).</Label>
                       <Input value={cur.ndCustomFormula ?? ""} onChange={(e) => set("ndCustomFormula", e.target.value)} placeholder="75" disabled={!editable} />
                     </div>
                   )}

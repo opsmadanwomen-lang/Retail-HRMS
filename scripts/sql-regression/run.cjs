@@ -14,6 +14,7 @@ const MIGS = ["0178_common_payroll_components_and_auto_salary_structure.sql", "0
 const MIG_0184 = MIGS[MIGS.length - 2];
 const MIG_0185 = MIGS[MIGS.length - 1];
 const MIG_0186 = path.join(ROOT, "supabase", "migrations", "0186_night_duty_rate_null_safety_and_validation.sql");
+const MIG_0187 = path.join(ROOT, "supabase", "migrations", "0187_night_duty_calendar_days_formula_variable.sql");
 const rd = (p) => fs.readFileSync(p, "utf8").replace(/^﻿/, "").replace(/\r\n/g, "\n");
 const results = [];
 const ok = (name, cond, extra = "") => results.push([cond ? "PASS" : "FAIL", name, cond ? "" : extra]);
@@ -149,6 +150,13 @@ const uid = (n) => `00000000-0000-0000-0000-${String(n).padStart(12, "0")}`;
   ok("0186 is re-runnable (idempotent)", !e186b, e186b ?? "");
   ok("STATIC: 0186 touches only payroll functions (no attendance / leave / advance / fnf / transfer / salary-structure engine is redefined)",
     !/create (or replace )?function public\.(attendance_|leave_|advance_|fnf_|_?transfer_|salary_|payroll_calculate_run)/i.test(rd(MIG_0186)));
+  let e187 = null; try { await db.exec(rd(MIG_0187)); } catch (e) { e187 = e.message.split("\n")[0]; }
+  ok("0187 applies cleanly on top of 0178-0186 (live-shaped schema)", !e187, e187 ?? "");
+  if (e187) return report();
+  let e187b = null; try { await db.exec(rd(MIG_0187)); } catch (e) { e187b = e.message.split("\n")[0]; }
+  ok("0187 is re-runnable (idempotent)", !e187b, e187b ?? "");
+  ok("STATIC: 0187 touches only payroll functions (no attendance / leave / advance / fnf / transfer / salary-structure engine is redefined)",
+    !/create (or replace )?function public\.(attendance_|leave_|advance_|fnf_|_?transfer_|salary_|payroll_calculate_run)/i.test(rd(MIG_0187)));
   ok("REGRESSION legacy PF/ESI/OT/LWP compute_lines output identical before vs after migrations", baseline === JSON.stringify(await cl(pol, 14000, 7000, 7000, { lwp: 2, ot: 120, comps: { DA: 7000, BASIC: 7000 } })));
   const allSql = MIGS.slice(0, -2).map(rd).join("\n");
   ok("STATIC: migrations 0178-0183 do not redefine payroll_calculate_run / attendance / leave / advance / fnf / transfer engines",
@@ -256,6 +264,54 @@ const uid = (n) => `00000000-0000-0000-0000-${String(n).padStart(12, "0")}`;
   const ndSumFor = async (start, end) => (await q(`select coalesce(sum(payable_extra_duty_value),0)::numeric v from public.attendance_records where employee_id='${gEmp}' and attendance_date between $1::date and $2::date`, [start, end]))[0].v;
   ok("0186 G: only the Night Duty days inside October 2026 are summed for an October payroll period (2+3=5), excluding September's 1 and November's 4 (the SAME date-range filter payroll_calculate_run uses)",
     Number(await ndSumFor("2026-10-01", "2026-10-31")) === 5 && Number(await ndSumFor("2026-09-01", "2026-09-30")) === 1 && Number(await ndSumFor("2026-11-01", "2026-11-30")) === 4);
+
+  // ------------------------------------------------------------------ 0187: Night Duty — new rate type "Basic+DA / Calendar Days"
+  // Business rule: Night Duty Amount = (Basic + DA) / Calendar Days x Approved ND Units, with NO percentage, and
+  // Calendar Days must be the ACTUAL calendar days in the payroll period — never a company's configurable proration
+  // divisor, never OT/Late's basis/std-hours. Implemented as plain PL/pgSQL numeric division (v_days), the SAME safe
+  // pattern already used by fixed/pct_of_basic/pct_of_basic_da — NOT via the Custom Formula text evaluator (see the
+  // DISCOVERED test right below for why that path is unsafe for this rule).
+  const pNdCalDays = await ndPol("NDCALDAYS", 308, ", nd_earning_enabled, nd_rate_type", ",true,'basic_da_per_calendar_day'");
+  const ndCal1 = ndOf(await clNd(pNdCalDays, 10000, 5000, 5000, 1));
+  const ndCal2 = ndOf(await clNd(pNdCalDays, 10000, 5000, 5000, 2));
+  const ndCal3 = ndOf(await clNd(pNdCalDays, 10000, 5000, 5000, 3));
+  const expCal = (n) => Math.round(n * (10000 / 31) * 100) / 100;
+  ok(`0187 A: Basic+DA/Calendar Days, October 2026 (31 days), NDVALUE=1 -> Rs ${expCal(1)} (no percentage field, no rate to configure)`,
+    Number(ndCal1?.amount) === expCal(1) && ndCal1?.unresolved === false, JSON.stringify(ndCal1));
+  ok(`0187 B: same rate type, NDVALUE=2 -> Rs ${expCal(2)}`, Number(ndCal2?.amount) === expCal(2), JSON.stringify(ndCal2));
+  ok(`0187 C: same rate type, NDVALUE=3 -> Rs ${expCal(3)}`, Number(ndCal3?.amount) === expCal(3), JSON.stringify(ndCal3));
+
+  // D. Must stay pinned to the period's real calendar days even when the policy's general proration divisor is
+  // something else entirely (fixed_26) — proving Night Duty does NOT silently inherit the proration engine.
+  const pNdFixed26 = (await q(
+    `insert into public.payroll_policies (company_id, status, effective_from, code, policy_name, version_no, currency_precision, proration_method, proration_basis, nd_earning_enabled, nd_rate_type)
+     values ('${C}','draft','2035-01-01','NDFIX26','NDFIX26',309,2,'fixed_26','basic_da',true,'basic_da_per_calendar_day') returning id`))[0].id;
+  const ndFix26 = ndOf(await clNd(pNdFixed26, 10000, 5000, 5000, 1));
+  ok("0187 D: proration_method='fixed_26' (the general proration divisor would be 26) does NOT change Night Duty's basis — it stays the real 31 (October), amount unchanged from test A",
+    Number(ndFix26?.amount) === expCal(1), JSON.stringify(ndFix26));
+
+  // E. Validate PASSES this rate type with no rate/formula configured at all (it is fully self-contained)
+  ok("0187 E: Validate PASSES 'basic_da_per_calendar_day' with no nd_rate and no nd_custom_formula set", (await ndValidate(pNdCalDays)).ok === true, JSON.stringify(await ndValidate(pNdCalDays)));
+
+  // F. 0186's NULL-safety and every other existing rate type are completely unaffected by 0187
+  ok("0187 F: 0186 NULL-safety untouched — blank pct_of_basic_da rate is still unresolved/₹0 after 0187",
+    ndOf(await clNd(pNdBlankPct, 10000, 5000, 5000, 2))?.unresolved === true);
+  ok("0187 F2: pre-existing flat custom formula ('75') still prices identically after 0187",
+    Number(ndOf(await clNd(pNdFormula, 10000, 5000, 5000, 2))?.amount) === 150);
+
+  // DISCOVERED (not fixed, out of scope): payroll_eval_formula() substitutes each variable as a bare numeric literal
+  // into a dynamic SQL string. Postgres parses whole-number literals as `integer`, so a Custom Formula dividing by a
+  // variable that happens to be a whole number (DIVISOR, or a hypothetical CALENDAR_DAYS) performs INTEGER division
+  // and silently TRUNCATES — e.g. (BASIC+DA)/DIVISOR with Basic+DA=10000 and DIVISOR=31 prices as 322, not 322.58.
+  // This is exactly why 0187 does NOT expose Night Duty's calendar-days rule via a Custom Formula: it would have
+  // silently produced the wrong ₹ amount. The defect is pre-existing (affects ANY custom formula anywhere in the
+  // system that divides by a whole-number variable, including OT/Late's own optional Custom Formula wage basis) and
+  // is NOT fixed here, since fixing the shared evaluator would also change OT/Late's Custom Formula behaviour, which
+  // must remain untouched. Recorded as a proven fact for the report, same convention as the 'NDVALUE * 75' finding above.
+  const pNdFormulaDiv = await ndPol("NDFORMDIV", 311, ", nd_earning_enabled, nd_rate_type, nd_custom_formula", ",true,'custom_formula','(BASIC+DA)/DIVISOR'");
+  const ndFormulaDiv = ndOf(await clNd(pNdFormulaDiv, 10000, 5000, 5000, 1));
+  ok("0187 DISCOVERED (not fixed, out of scope): payroll_eval_formula's Custom Formula path does INTEGER division for whole-number literals — (BASIC+DA)/DIVISOR with 10000/31 silently prices as 322, not 322.58 — proving Custom Formula is unsafe for this business rule and confirming 0187's choice of a dedicated numeric rate type instead",
+    Number(ndFormulaDiv?.amount) === 322 && Number(ndFormulaDiv?.amount) !== expCal(1), JSON.stringify(ndFormulaDiv));
 
   // ------------------------------------------------------------------ A. salary routing (slab table + resolver)
   const core = async (g) => (await q(`select r.*, (select code from public.salary_structures s where s.id=r.salary_structure_id) code from public.salary_resolve_core('${E.E1}', '2026-10-31', $1::numeric) r`, [g]))[0];
